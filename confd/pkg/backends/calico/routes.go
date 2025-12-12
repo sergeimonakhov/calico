@@ -229,6 +229,14 @@ func (rg *routeGenerator) setRouteForSvc(svc *v1.Service, ep *discoveryv1.Endpoi
 	defer rg.Unlock()
 
 	advertise := rg.advertiseThisService(svc, eps)
+	// Local services (ExternalTrafficPolicy=Local) require a delay before advertising
+	// their routes. The reason is that route advertisement is fully event-driven and
+	// may be triggered before the dataplane (eBPF programs, conntrack state, or
+	// hostport/NAT maps) has finished installing all local forwarding state for the
+	// new endpoint.
+	if advertise && svc.Spec.ExternalTrafficPolicy == v1.ServiceExternalTrafficPolicyTypeLocal {
+		time.Sleep(rg.client.localEndpointDelay())
+	}
 	logCtx.WithField("advertise", advertise).Debug("Checking routes for service")
 	if advertise {
 		routes := rg.getAllRoutesForService(svc)
