@@ -214,7 +214,7 @@ func TestBPFProgCleanerDoesNotDeleteRevivedIPv6NATPairAfterTimestampCheck(t *tes
 		KeySize:    4,
 		ValueSize:  4,
 		MaxEntries: 1,
-		Name:       "cali_ct_cleanup_race_sync",
+		Name:       "cali_ct_race",
 		Version:    1,
 	})
 	Expect(controlMap.EnsureExists()).To(Succeed(), "failed to create cleaner race control map")

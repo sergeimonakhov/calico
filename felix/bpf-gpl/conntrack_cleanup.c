@@ -21,13 +21,13 @@ const volatile struct cali_ct_cleanup_globals __globals;
 // cleaner to pause after its timestamp comparison; state 2 reports that it is
 // paused; state 3 releases it; state 4 reports a timeout.  This map and hook
 // are absent from production objects.
-CALI_MAP_NAMED(cali_ct_cleanup_race_sync, cali_ct_cleanup_race_sync, ,
+CALI_MAP_NAMED(cali_ct_race, cali_ct_race, ,
 	BPF_MAP_TYPE_ARRAY, __u32, __u32, 1, 0);
 
 static CALI_BPF_INLINE void ct_cleanup_test_pause_after_timestamp_check(void)
 {
 	__u32 zero = 0;
-	volatile __u32 *state = cali_ct_cleanup_race_sync_lookup_elem(&zero);
+	volatile __u32 *state = cali_ct_race_lookup_elem(&zero);
 	if (!state || *state != 1) {
 		return;
 	}
