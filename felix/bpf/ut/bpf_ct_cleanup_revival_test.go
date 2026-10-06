@@ -16,16 +16,22 @@ package ut_test
 
 import (
 	"bytes"
+	"encoding/binary"
 	"net"
+	"os"
+	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
 	. "github.com/onsi/gomega"
 
+	"github.com/projectcalico/calico/felix/bpf"
 	"github.com/projectcalico/calico/felix/bpf/conntrack"
 	"github.com/projectcalico/calico/felix/bpf/conntrack/cleanupv1"
 	"github.com/projectcalico/calico/felix/bpf/conntrack/cttestdata"
 	"github.com/projectcalico/calico/felix/bpf/conntrack/timeouts"
+	"github.com/projectcalico/calico/felix/bpf/libbpf"
 	"github.com/projectcalico/calico/felix/bpf/maps"
 	"github.com/projectcalico/calico/felix/timeshim/mocktime"
 )
@@ -188,6 +194,157 @@ func TestBPFProgCleanerIPv6NATPairs(t *testing.T) {
 			}
 		})
 	}
+}
+
+// This regression test pauses the BPF cleaner immediately after its timestamp
+// comparison, refreshes the reverse entry, then resumes cleanup. The refreshed
+// pair must survive. The test-only pause point makes the compare/delete race
+// deterministic without changing the production BPF object.
+func TestBPFProgCleanerDoesNotDeleteRevivedIPv6NATPairAfterTimestampCheck(t *testing.T) {
+	RegisterTestingT(t)
+	resetMap(ctMapV6)
+	resetMap(ctCleanupMapV6)
+	t.Cleanup(func() {
+		resetMap(ctMapV6)
+		resetMap(ctCleanupMapV6)
+	})
+
+	controlMap := maps.NewPinnedMap(maps.MapParameters{
+		Type:       "array",
+		KeySize:    4,
+		ValueSize:  4,
+		MaxEntries: 1,
+		Name:       "cali_ct_cleanup_race_sync",
+		Version:    1,
+	})
+	Expect(controlMap.EnsureExists()).To(Succeed(), "failed to create cleaner race control map")
+	t.Cleanup(func() {
+		mapPath := controlMap.Path()
+		_ = controlMap.Close()
+		_ = os.Remove(mapPath)
+	})
+	controlKey := make([]byte, 4)
+	setRaceControlState := func(state uint32) {
+		value := make([]byte, 4)
+		binary.LittleEndian.PutUint32(value, state)
+		Expect(controlMap.Update(controlKey, value)).To(Succeed())
+	}
+	setRaceControlState(1)
+
+	_, sourceFile, _, ok := runtime.Caller(0)
+	Expect(ok).To(BeTrue(), "failed to find the BPF UT source directory")
+	raceObjectPath := filepath.Clean(filepath.Join(filepath.Dir(sourceFile), "../../bpf-gpl/ut/conntrack_cleanup_race_v6.o"))
+	cleanerObject, err := bpf.LoadObject(raceObjectPath, &libbpf.CTCleanupGlobalData{
+		CreationGracePeriod: timeouts.DefaultTimeouts().CreationGracePeriod,
+		TCPSynSent:          timeouts.DefaultTimeouts().TCPSynSent,
+		TCPEstablished:      timeouts.DefaultTimeouts().TCPEstablished,
+		TCPFinsSeen:         timeouts.DefaultTimeouts().TCPFinsSeen,
+		TCPResetSeen:        timeouts.DefaultTimeouts().TCPResetSeen,
+		UDPTimeout:          timeouts.DefaultTimeouts().UDPTimeout,
+		GenericTimeout:      timeouts.DefaultTimeouts().GenericTimeout,
+		ICMPTimeout:         timeouts.DefaultTimeouts().ICMPTimeout,
+	})
+	Expect(err).NotTo(HaveOccurred(), "failed to load the race-instrumented IPv6 cleaner")
+
+	cleaner := &ctCleanupRaceTestRunner{object: cleanerObject}
+	livenessScanner := conntrack.NewLivenessScanner(
+		timeouts.DefaultTimeouts(), true, conntrack.WithTimeShim(mocktime.New()),
+	)
+	scanner := conntrack.NewScanner(
+		ctMapV6, conntrack.KeyV6FromBytes, conntrack.ValueV6FromBytes,
+		nil, "Disabled", ctCleanupMapV6.(maps.MapWithExistsCheck), 6, cleaner, livenessScanner,
+	)
+	t.Cleanup(func() { scanner.Close() })
+
+	fwdKey := conntrack.NewKeyV6(
+		conntrack.ProtoTCP,
+		net.ParseIP("2001:db8::1"), 5555,
+		net.ParseIP("2001:db8::100"), 80,
+	)
+	revKey := conntrack.NewKeyV6(
+		conntrack.ProtoTCP,
+		net.ParseIP("2001:db8::1"), 5555,
+		net.ParseIP("2001:db8::2"), 8080,
+	)
+	leg := conntrack.Leg{SynSeen: true, AckSeen: true}
+	staleLastSeen := cttestdata.Now - 2*time.Hour
+	fwdValue := conntrack.NewValueV6NATForward(cttestdata.Now-3*time.Hour, 0, revKey)
+	revValue := conntrack.NewValueV6NATReverse(staleLastSeen, 0, leg, leg, nil, nil, 5555)
+	Expect(ctMapV6.Update(fwdKey.AsBytes(), fwdValue.AsBytes())).To(Succeed())
+	Expect(ctMapV6.Update(revKey.AsBytes(), revValue.AsBytes())).To(Succeed())
+
+	scanDone := make(chan struct{})
+	go func() {
+		scanner.Scan()
+		close(scanDone)
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		value, getErr := controlMap.Get(controlKey)
+		Expect(getErr).NotTo(HaveOccurred())
+		state := binary.LittleEndian.Uint32(value)
+		if state == 2 {
+			break
+		}
+		Expect(state).NotTo(Equal(uint32(4)), "BPF cleaner timed out at the race barrier")
+		select {
+		case <-scanDone:
+			Fail("BPF cleaner finished without reaching the compare/delete race barrier")
+		default:
+		}
+		Expect(time.Now().Before(deadline)).To(BeTrue(), "timed out waiting for cleaner to reach race barrier")
+		time.Sleep(100 * time.Microsecond)
+	}
+
+	// This update happens after the cleaner compared the queued and current
+	// timestamps, but before it calls bpf_map_delete_elem().
+	freshReverse := conntrack.NewValueV6NATReverse(cttestdata.Now, 0, leg, leg, nil, nil, 5555)
+	Expect(ctMapV6.Update(revKey.AsBytes(), freshReverse.AsBytes())).To(Succeed())
+	setRaceControlState(3)
+
+	select {
+	case <-scanDone:
+	case <-time.After(5 * time.Second):
+		Fail("BPF cleaner did not finish after the race barrier was released")
+	}
+
+	_, fwdErr := ctMapV6.Get(fwdKey.AsBytes())
+	_, revErr := ctMapV6.Get(revKey.AsBytes())
+	Expect(fwdErr).NotTo(HaveOccurred(), "forward entry should survive the race")
+	Expect(revErr).NotTo(HaveOccurred(), "refreshed reverse entry should survive the race")
+}
+
+type ctCleanupRaceTestRunner struct {
+	object *libbpf.Obj
+}
+
+func (r *ctCleanupRaceTestRunner) Run(opts ...conntrack.RunOpt) (*conntrack.CleanupContext, error) {
+	var cleanupContext conntrack.CleanupContext
+	for _, opt := range opts {
+		opt(&cleanupContext)
+	}
+	var input [24]byte
+	binary.LittleEndian.PutUint64(input[0:8], cleanupContext.StartTime)
+	binary.LittleEndian.PutUint64(input[8:16], cleanupContext.EndTime)
+	binary.LittleEndian.PutUint64(input[16:24], cleanupContext.NumKVsCleaned)
+	programFD, err := r.object.ProgramFD("conntrack_cleanup")
+	if err != nil {
+		return nil, err
+	}
+	result, err := bpf.RunBPFProgram(bpf.ProgFD(programFD), input[:], 1)
+	if err != nil {
+		return nil, err
+	}
+	_, err = binary.Decode(result.DataOut, binary.LittleEndian, &cleanupContext)
+	if err != nil {
+		return nil, err
+	}
+	return &cleanupContext, nil
+}
+
+func (r *ctCleanupRaceTestRunner) Close() error {
+	return r.object.Close()
 }
 
 type ctCleanupRevivalHook struct {
