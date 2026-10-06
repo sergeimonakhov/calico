@@ -50,6 +50,15 @@ struct ct_iter_ctx {
 	__u64 num_cleaned;
 };
 
+// A packet can update last_seen while the cleaner is running on another CPU.
+// Force each check to read the map value again instead of reusing an earlier
+// compiler load. This narrows the race, but a map lookup and delete cannot be
+// made atomic with the BPF helpers available to this program.
+static CALI_BPF_INLINE bool ct_last_seen_unchanged(struct calico_ct_value *v, __u64 expected)
+{
+	return v && *(volatile __u64 *)&v->last_seen == expected;
+}
+
 // process_ccq_entry processes an entry in the "cleanup queue" map. The map
 // is keyed with conntrack key which the userspace cleaner sees as expired.
 // The value has <rev_key>:<last_seen_ts>:<rev_last_seen_ts>
@@ -63,7 +72,7 @@ static long process_ccq_entry(void *map, struct calico_ct_key *key, struct cali_
 	// If the entry is a reverse entry, compare the timestamps and delete the key.
 	if (!value->rev_key.protocol) {
 		actual_ct_value = cali_ct_lookup_elem(key);
-		if (actual_ct_value && (actual_ct_value->last_seen == value->last_seen)) {
+		if (ct_last_seen_unchanged(actual_ct_value, value->last_seen)) {
 			// Decrement the per-pod connlimit counter if this entry
 			// carried one of the CONNLIMIT_* flags and the packet
 			// path didn't already decrement.
@@ -80,14 +89,29 @@ static long process_ccq_entry(void *map, struct calico_ct_key *key, struct cali_
 		if (nat_fwd_value) {
 			struct calico_ct_key *nat_rev_key = &nat_fwd_value->nat_rev_key;
 			if (__builtin_memcmp(nat_rev_key, rev_key, sizeof(struct calico_ct_key))) {
-		       		goto delete;
+				goto delete;
+			}
+			// The packet path refreshes the forward entry before it
+			// refreshes the reverse entry. Checking only the reverse
+			// timestamp can therefore delete a pair touched by a packet.
+			if (!ct_last_seen_unchanged(nat_fwd_value, value->last_seen)) {
+				goto delete;
 			}
 		}
 		struct calico_ct_value *rev_ct_value = cali_ct_lookup_elem(rev_key);
-		if (rev_ct_value && (rev_ct_value->last_seen == value->rev_last_seen)) {
+		if (ct_last_seen_unchanged(rev_ct_value, value->rev_last_seen)) {
 #ifdef CALI_CT_CLEANUP_TEST_RACE
 			ct_cleanup_test_refresh_after_timestamp_check(rev_ct_value, ictx->now);
 #endif
+			// Recheck after the other lookup and the test interleaving. In
+			// particular, do not decrement connlimit for a revived flow.
+			if (!ct_last_seen_unchanged(rev_ct_value, value->rev_last_seen) ||
+				(nat_fwd_value &&
+				 (!ct_last_seen_unchanged(nat_fwd_value, value->last_seen) ||
+				  __builtin_memcmp(&nat_fwd_value->nat_rev_key, rev_key,
+						   sizeof(struct calico_ct_key))))) {
+				goto delete;
+			}
 			// The reverse leg holds the connlimit flags + ifindex.
 			qos_connlimit_decrement_for_ct(rev_ct_value);
 			if (!cali_ct_delete_elem(rev_key)) {

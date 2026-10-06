@@ -118,6 +118,7 @@ func TestBPFProgCleanerIPv6NATPairs(t *testing.T) {
 		name                  string
 		reverseLastSeen       time.Duration
 		refreshReverseOnQueue bool
+		refreshForwardOnQueue bool
 		wantEntries           bool
 	}{
 		{
@@ -136,6 +137,12 @@ func TestBPFProgCleanerIPv6NATPairs(t *testing.T) {
 			refreshReverseOnQueue: true,
 			wantEntries:           true,
 		},
+		{
+			name:                  "revived forward entry keeps the pair",
+			reverseLastSeen:       cttestdata.Now - 2*time.Hour,
+			refreshForwardOnQueue: true,
+			wantEntries:           true,
+		},
 	}
 
 	for _, tc := range tests {
@@ -149,7 +156,7 @@ func TestBPFProgCleanerIPv6NATPairs(t *testing.T) {
 			})
 
 			cleanupMap := ctCleanupMapV6.(maps.MapWithExistsCheck)
-			if tc.refreshReverseOnQueue {
+			if tc.refreshReverseOnQueue || tc.refreshForwardOnQueue {
 				cleanupMap = &ctCleanupRevivalHook{
 					MapWithExistsCheck: cleanupMap,
 					afterUpdate: func(key, value []byte) {
@@ -157,10 +164,16 @@ func TestBPFProgCleanerIPv6NATPairs(t *testing.T) {
 							return
 						}
 						queuedValue := conntrack.CleanupValueV6FromBytes(value)
-						Expect(queuedValue.RevTimestamp()).To(Equal(uint64(tc.reverseLastSeen)))
-
-						freshReverse := conntrack.NewValueV6NATReverse(cttestdata.Now, 0, leg, leg, nil, nil, 5555)
-						Expect(ctMapV6.Update(revKey.AsBytes(), freshReverse.AsBytes())).To(Succeed())
+						if tc.refreshReverseOnQueue {
+							Expect(queuedValue.RevTimestamp()).To(Equal(uint64(tc.reverseLastSeen)))
+							freshReverse := conntrack.NewValueV6NATReverse(cttestdata.Now, 0, leg, leg, nil, nil, 5555)
+							Expect(ctMapV6.Update(revKey.AsBytes(), freshReverse.AsBytes())).To(Succeed())
+						}
+						if tc.refreshForwardOnQueue {
+							Expect(queuedValue.Timestamp()).To(Equal(uint64(cttestdata.Now - 3*time.Hour)))
+							freshForward := conntrack.NewValueV6NATForward(cttestdata.Now, 0, revKey)
+							Expect(ctMapV6.Update(fwdKey.AsBytes(), freshForward.AsBytes())).To(Succeed())
+						}
 					},
 				}
 			}
