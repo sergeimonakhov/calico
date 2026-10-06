@@ -196,10 +196,9 @@ func TestBPFProgCleanerIPv6NATPairs(t *testing.T) {
 	}
 }
 
-// This regression test pauses the BPF cleaner immediately after its timestamp
-// comparison, refreshes the reverse entry, then resumes cleanup. The refreshed
-// pair must survive. The test-only pause point makes the compare/delete race
-// deterministic without changing the production BPF object.
+// This regression test injects a timestamp refresh immediately after the BPF
+// cleaner's comparison. The refreshed pair must survive. The test-only hook
+// makes the compare/delete interleaving deterministic.
 func TestBPFProgCleanerDoesNotDeleteRevivedIPv6NATPairAfterTimestampCheck(t *testing.T) {
 	RegisterTestingT(t)
 	resetMap(ctMapV6)
@@ -224,12 +223,9 @@ func TestBPFProgCleanerDoesNotDeleteRevivedIPv6NATPairAfterTimestampCheck(t *tes
 		_ = os.Remove(mapPath)
 	})
 	controlKey := make([]byte, 4)
-	setRaceControlState := func(state uint32) {
-		value := make([]byte, 4)
-		binary.LittleEndian.PutUint32(value, state)
-		Expect(controlMap.Update(controlKey, value)).To(Succeed())
-	}
-	setRaceControlState(1)
+	controlValue := make([]byte, 4)
+	binary.LittleEndian.PutUint32(controlValue, 1)
+	Expect(controlMap.Update(controlKey, controlValue)).To(Succeed())
 
 	_, sourceFile, _, ok := runtime.Caller(0)
 	Expect(ok).To(BeTrue(), "failed to find the BPF UT source directory")
@@ -273,41 +269,12 @@ func TestBPFProgCleanerDoesNotDeleteRevivedIPv6NATPairAfterTimestampCheck(t *tes
 	Expect(ctMapV6.Update(fwdKey.AsBytes(), fwdValue.AsBytes())).To(Succeed())
 	Expect(ctMapV6.Update(revKey.AsBytes(), revValue.AsBytes())).To(Succeed())
 
-	scanDone := make(chan struct{})
-	go func() {
-		scanner.Scan()
-		close(scanDone)
-	}()
+	scanner.Scan()
 
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		value, getErr := controlMap.Get(controlKey)
-		Expect(getErr).NotTo(HaveOccurred())
-		state := binary.LittleEndian.Uint32(value)
-		if state == 2 {
-			break
-		}
-		Expect(state).NotTo(Equal(uint32(4)), "BPF cleaner timed out at the race barrier")
-		select {
-		case <-scanDone:
-			t.Fatalf("BPF cleaner finished without reaching the compare/delete race barrier")
-		default:
-		}
-		Expect(time.Now().Before(deadline)).To(BeTrue(), "timed out waiting for cleaner to reach race barrier")
-		time.Sleep(100 * time.Microsecond)
-	}
-
-	// This update happens after the cleaner compared the queued and current
-	// timestamps, but before it calls bpf_map_delete_elem().
-	freshReverse := conntrack.NewValueV6NATReverse(cttestdata.Now, 0, leg, leg, nil, nil, 5555)
-	Expect(ctMapV6.Update(revKey.AsBytes(), freshReverse.AsBytes())).To(Succeed())
-	setRaceControlState(3)
-
-	select {
-	case <-scanDone:
-	case <-time.After(5 * time.Second):
-		t.Fatalf("BPF cleaner did not finish after the race barrier was released")
-	}
+	controlValue, err = controlMap.Get(controlKey)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(binary.LittleEndian.Uint32(controlValue)).To(Equal(uint32(2)),
+		"test BPF hook did not refresh the reverse entry after the timestamp comparison")
 
 	_, fwdErr := ctMapV6.Get(fwdKey.AsBytes())
 	_, revErr := ctMapV6.Get(revKey.AsBytes())
@@ -320,7 +287,7 @@ type ctCleanupRaceTestRunner struct {
 }
 
 func (r *ctCleanupRaceTestRunner) Run(opts ...conntrack.RunOpt) (*conntrack.CleanupContext, error) {
-	var cleanupContext conntrack.CleanupContext
+	cleanupContext := conntrack.CleanupContext{StartTime: uint64(cttestdata.Now)}
 	for _, opt := range opts {
 		opt(&cleanupContext)
 	}

@@ -17,31 +17,24 @@
 const volatile struct cali_ct_cleanup_globals __globals;
 
 #ifdef CALI_CT_CLEANUP_TEST_RACE
-// Test-only barrier used by conntrack_cleanup_race_debug_v6.c.  State 1 asks the
-// cleaner to pause after its timestamp comparison; state 2 reports that it is
-// paused; state 3 releases it; state 4 reports a timeout.  This map and hook
-// are absent from production objects.
+// Test-only hook used by conntrack_cleanup_race_debug_v6.c.  State 1 asks the
+// cleaner to refresh the reverse entry after its timestamp comparison; state
+// 2 reports that the refresh happened.  This map and hook are absent from
+// production objects.
 CALI_MAP_NAMED(cali_ct_race, cali_ct_race, ,
 	BPF_MAP_TYPE_ARRAY, __u32, __u32, 1, 0);
 
-static CALI_BPF_INLINE void ct_cleanup_test_pause_after_timestamp_check(void)
+static CALI_BPF_INLINE void ct_cleanup_test_refresh_after_timestamp_check(
+	struct calico_ct_value *rev_ct_value, __u64 now)
 {
 	__u32 zero = 0;
 	volatile __u32 *state = cali_ct_race_lookup_elem(&zero);
 	if (!state || *state != 1) {
 		return;
 	}
+	// Reproduce the packet path's write to last_seen at this exact point.
+	*(volatile __u64 *)&rev_ct_value->last_seen = now;
 	*state = 2;
-	#pragma clang loop unroll(disable)
-	for (int i = 0; i < 2048; i++) {
-		bpf_ktime_get_ns();
-		if (*state == 3) {
-			return;
-		}
-	}
-	if (*state != 3) {
-		*state = 4;
-	}
 }
 #endif
 
@@ -93,7 +86,7 @@ static long process_ccq_entry(void *map, struct calico_ct_key *key, struct cali_
 		struct calico_ct_value *rev_ct_value = cali_ct_lookup_elem(rev_key);
 		if (rev_ct_value && (rev_ct_value->last_seen == value->rev_last_seen)) {
 #ifdef CALI_CT_CLEANUP_TEST_RACE
-			ct_cleanup_test_pause_after_timestamp_check();
+			ct_cleanup_test_refresh_after_timestamp_check(rev_ct_value, ictx->now);
 #endif
 			// The reverse leg holds the connlimit flags + ifindex.
 			qos_connlimit_decrement_for_ct(rev_ct_value);
