@@ -76,6 +76,7 @@ UT_C_FILES:=$(shell find ut -name '*.c')
 UT_OBJS:=$(UT_C_FILES:.c=.o) $(shell ./list-ut-objs)
 UT_OBJS+=ut/ip_parse_test_v6.o
 UT_OBJS+=ut/tcp_rst_v6.o
+UT_OBJS+=bin/conntrack_cleanup_race_debug_v6.o
 
 XDP_MAP_HEADERS := jump.h
 COMMON_MAP_HEADERS := counters.h ifstate.h ringbuf.h profiling.h rule_counters.h qos.h ctlb_map.h $(XDP_MAP_HEADERS)
@@ -302,6 +303,11 @@ bin/from%.o: from%.ll | bin
 bin/test%.o: test%.ll | bin
 	$(LINK)
 bin/xdp%.o: xdp%.ll | bin
+	$(LINK)
+bin/conntrack_cleanup_race_debug_v6.ll: private CFLAGS += -DCALI_CT_CLEANUP_TEST_RACE
+bin/conntrack_cleanup_race_debug_v6.ll: conntrack_cleanup_race_debug_v6.c conntrack_cleanup_v6.d calculate-flags
+	$(COMPILE)
+bin/conntrack_cleanup_race_debug_v6.o: bin/conntrack_cleanup_race_debug_v6.ll | bin
 	$(LINK)
 ut/%.o: ut/%.ll
 	$(LINK)

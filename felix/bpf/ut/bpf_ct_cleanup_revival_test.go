@@ -233,7 +233,7 @@ func TestBPFProgCleanerDoesNotDeleteRevivedIPv6NATPairAfterTimestampCheck(t *tes
 
 	_, sourceFile, _, ok := runtime.Caller(0)
 	Expect(ok).To(BeTrue(), "failed to find the BPF UT source directory")
-	raceObjectPath := filepath.Clean(filepath.Join(filepath.Dir(sourceFile), "../../bpf-gpl/ut/conntrack_cleanup_race_v6.o"))
+	raceObjectPath := filepath.Clean(filepath.Join(filepath.Dir(sourceFile), "../../bpf-gpl/bin/conntrack_cleanup_race_debug_v6.o"))
 	cleanerObject, err := bpf.LoadObject(raceObjectPath, &libbpf.CTCleanupGlobalData{
 		CreationGracePeriod: timeouts.DefaultTimeouts().CreationGracePeriod,
 		TCPSynSent:          timeouts.DefaultTimeouts().TCPSynSent,
