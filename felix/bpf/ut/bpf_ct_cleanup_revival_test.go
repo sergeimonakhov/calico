@@ -290,7 +290,7 @@ func TestBPFProgCleanerDoesNotDeleteRevivedIPv6NATPairAfterTimestampCheck(t *tes
 		Expect(state).NotTo(Equal(uint32(4)), "BPF cleaner timed out at the race barrier")
 		select {
 		case <-scanDone:
-			Fail("BPF cleaner finished without reaching the compare/delete race barrier")
+			t.Fatalf("BPF cleaner finished without reaching the compare/delete race barrier")
 		default:
 		}
 		Expect(time.Now().Before(deadline)).To(BeTrue(), "timed out waiting for cleaner to reach race barrier")
@@ -306,7 +306,7 @@ func TestBPFProgCleanerDoesNotDeleteRevivedIPv6NATPairAfterTimestampCheck(t *tes
 	select {
 	case <-scanDone:
 	case <-time.After(5 * time.Second):
-		Fail("BPF cleaner did not finish after the race barrier was released")
+		t.Fatalf("BPF cleaner did not finish after the race barrier was released")
 	}
 
 	_, fwdErr := ctMapV6.Get(fwdKey.AsBytes())
