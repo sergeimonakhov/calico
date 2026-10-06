@@ -93,6 +93,103 @@ func TestBPFProgCleanerDoesNotDeleteRevivedIPv6OrphanNATReverse(t *testing.T) {
 	Expect(len(cleanupQueue)).To(BeZero())
 }
 
+func TestBPFProgCleanerIPv6NATPairs(t *testing.T) {
+	RegisterTestingT(t)
+
+	fwdKey := conntrack.NewKeyV6(
+		conntrack.ProtoTCP,
+		net.ParseIP("2001:db8::1"), 5555,
+		net.ParseIP("2001:db8::100"), 80,
+	)
+	revKey := conntrack.NewKeyV6(
+		conntrack.ProtoTCP,
+		net.ParseIP("2001:db8::1"), 5555,
+		net.ParseIP("2001:db8::2"), 8080,
+	)
+	leg := conntrack.Leg{SynSeen: true, AckSeen: true}
+
+	tests := []struct {
+		name                  string
+		reverseLastSeen       time.Duration
+		refreshReverseOnQueue bool
+		wantEntries           bool
+	}{
+		{
+			name:            "live forward and reverse entries survive",
+			reverseLastSeen: cttestdata.Now - 59*time.Minute,
+			wantEntries:     true,
+		},
+		{
+			name:            "expired forward and reverse entries are deleted",
+			reverseLastSeen: cttestdata.Now - 2*time.Hour,
+			wantEntries:     false,
+		},
+		{
+			name:                  "revived reverse entry keeps the pair",
+			reverseLastSeen:       cttestdata.Now - 2*time.Hour,
+			refreshReverseOnQueue: true,
+			wantEntries:           true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			RegisterTestingT(t)
+			resetMap(ctMapV6)
+			resetMap(ctCleanupMapV6)
+			t.Cleanup(func() {
+				resetMap(ctMapV6)
+				resetMap(ctCleanupMapV6)
+			})
+
+			cleanupMap := ctCleanupMapV6.(maps.MapWithExistsCheck)
+			if tc.refreshReverseOnQueue {
+				cleanupMap = &ctCleanupRevivalHook{
+					MapWithExistsCheck: cleanupMap,
+					afterUpdate: func(key, value []byte) {
+						if !bytes.Equal(key, fwdKey.AsBytes()) {
+							return
+						}
+						queuedValue := conntrack.CleanupValueV6FromBytes(value)
+						Expect(queuedValue.RevTimestamp()).To(Equal(uint64(tc.reverseLastSeen)))
+
+						freshReverse := conntrack.NewValueV6NATReverse(cttestdata.Now, 0, leg, leg, nil, nil, 5555)
+						Expect(ctMapV6.Update(revKey.AsBytes(), freshReverse.AsBytes())).To(Succeed())
+					},
+				}
+			}
+
+			livenessScanner := conntrack.NewLivenessScanner(
+				timeouts.DefaultTimeouts(), true, conntrack.WithTimeShim(mocktime.New()),
+			)
+			cleaner, err := conntrack.NewBPFProgCleaner(6, timeouts.DefaultTimeouts(), conntrack.BPFLogLevelDebug)
+			Expect(err).NotTo(HaveOccurred(), "failed to create IPv6 BPF cleaner")
+			scanner := conntrack.NewScanner(
+				ctMapV6, conntrack.KeyV6FromBytes, conntrack.ValueV6FromBytes,
+				nil, "Disabled", cleanupMap, 6, cleaner, livenessScanner,
+			)
+			t.Cleanup(func() { scanner.Close() })
+
+			fwdValue := conntrack.NewValueV6NATForward(cttestdata.Now-3*time.Hour, 0, revKey)
+			revValue := conntrack.NewValueV6NATReverse(tc.reverseLastSeen, 0, leg, leg, nil, nil, 5555)
+			Expect(ctMapV6.Update(fwdKey.AsBytes(), fwdValue.AsBytes())).To(Succeed())
+			Expect(ctMapV6.Update(revKey.AsBytes(), revValue.AsBytes())).To(Succeed())
+
+			scanner.Scan()
+
+			_, fwdErr := ctMapV6.Get(fwdKey.AsBytes())
+			_, revErr := ctMapV6.Get(revKey.AsBytes())
+			if tc.wantEntries {
+				Expect(fwdErr).NotTo(HaveOccurred(), "forward NAT entry should survive")
+				Expect(revErr).NotTo(HaveOccurred(), "reverse NAT entry should survive")
+			} else {
+				Expect(maps.IsNotExists(fwdErr)).To(BeTrue(), "forward NAT entry should be deleted")
+				Expect(maps.IsNotExists(revErr)).To(BeTrue(), "reverse NAT entry should be deleted")
+			}
+		})
+	}
+}
+
 type ctCleanupRevivalHook struct {
 	maps.MapWithExistsCheck
 	afterUpdate func(key, value []byte)
