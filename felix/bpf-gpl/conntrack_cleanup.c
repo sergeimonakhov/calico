@@ -17,7 +17,7 @@
 const volatile struct cali_ct_cleanup_globals __globals;
 
 #ifdef CALI_CT_CLEANUP_TEST_RACE
-// Test-only barrier used by ut/conntrack_cleanup_race_v6.c.  State 1 asks the
+// Test-only barrier used by conntrack_cleanup_race_debug_v6.c.  State 1 asks the
 // cleaner to pause after its timestamp comparison; state 2 reports that it is
 // paused; state 3 releases it; state 4 reports a timeout.  This map and hook
 // are absent from production objects.
@@ -33,13 +33,15 @@ static CALI_BPF_INLINE void ct_cleanup_test_pause_after_timestamp_check(void)
 	}
 	*state = 2;
 	#pragma clang loop unroll(disable)
-	for (int i = 0; i < 100000; i++) {
+	for (int i = 0; i < 2048; i++) {
 		bpf_ktime_get_ns();
 		if (*state == 3) {
 			return;
 		}
 	}
-	*state = 4;
+	if (*state != 3) {
+		*state = 4;
+	}
 }
 #endif
 
