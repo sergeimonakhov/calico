@@ -200,6 +200,37 @@ static CALI_BPF_INLINE struct calico_ct_value *ct_fwd_tracking(struct calico_ct_
 	return rev;
 }
 
+/* ct_recycle_nat_rev_create_collision tries to clear a closed or stale entry that blocked NAT reverse creation. */
+static CALI_BPF_INLINE int ct_recycle_nat_rev_create_collision(struct calico_ct_key *k,
+							      struct calico_ct_value *ct_value)
+{
+	struct calico_ct_value *old = cali_ct_lookup_elem(k);
+
+	if (!old) {
+		return cali_ct_update_elem(k, ct_value, BPF_NOEXIST);
+	}
+	if (old->type == CALI_CT_TYPE_NAT_FWD) {
+		/* Another flow's forward entry: judge the connection it tracks. */
+		struct calico_ct_value *trk = ct_fwd_tracking(k, old);
+		if (!trk) {
+			CALI_DEBUG("CT-ALL deleting stale forward entry at the NAT reverse create key");
+			cali_ct_delete_elem(k);
+			return cali_ct_update_elem(k, ct_value, BPF_NOEXIST);
+		} else if (tcp_recycled(true, trk)) {
+			CALI_DEBUG("CT-ALL recycling closed NAT connection at the NAT reverse create key");
+			ct_recycle(trk, &old->nat_rev_key);
+			cali_ct_delete_elem(k);
+			return cali_ct_update_elem(k, ct_value, BPF_NOEXIST);
+		}
+	} else if (tcp_recycled(true, old)) {
+		CALI_DEBUG("CT-ALL recycling closed entry at the NAT reverse create key");
+		ct_recycle(old, k);
+		return cali_ct_update_elem(k, ct_value, BPF_NOEXIST);
+	}
+
+	return -17; /* EEXIST */
+}
+
 static CALI_BPF_INLINE int calico_ct_v4_create_tracking(struct cali_tc_ctx *ctx,
 							struct ct_create_ctx *ct_ctx,
 							struct calico_ct_key *k)
@@ -381,25 +412,7 @@ create:
 
 	/* A NAT'd SYN never looked up the post-NAT key, so a closed entry there was not recycled yet. */
 	if (err == -17 /* EEXIST */ && ct_ctx->type == CALI_CT_TYPE_NAT_REV && syn && !ack) {
-		struct calico_ct_value *old = cali_ct_lookup_elem(k);
-		if (old && old->type == CALI_CT_TYPE_NAT_FWD) {
-			/* Another flow's forward entry: judge the connection it tracks. */
-			struct calico_ct_value *trk = ct_fwd_tracking(k, old);
-			if (!trk) {
-				CALI_DEBUG("CT-ALL deleting stale forward entry at the post-NAT key");
-				cali_ct_delete_elem(k);
-				err = cali_ct_update_elem(k, &ct_value, BPF_NOEXIST);
-			} else if (tcp_recycled(true, trk)) {
-				CALI_DEBUG("CT-ALL recycling closed NAT connection at the post-NAT key");
-				ct_recycle(trk, &old->nat_rev_key);
-				cali_ct_delete_elem(k);
-				err = cali_ct_update_elem(k, &ct_value, BPF_NOEXIST);
-			}
-		} else if (old && tcp_recycled(true, old)) {
-			CALI_DEBUG("CT-ALL recycling closed entry at the post-NAT key");
-			ct_recycle(old, k);
-			err = cali_ct_update_elem(k, &ct_value, BPF_NOEXIST);
-		}
+		err = ct_recycle_nat_rev_create_collision(k, &ct_value);
 	}
 
 	if (CALI_F_HEP && err == -17 /* EEXIST */) {
@@ -422,7 +435,11 @@ create:
 
 			fill_ct_key(k, src_lt_dst, ct_ctx->proto, &ct_ctx->src, &ct_ctx->dst, sport, dport);
 
-			if (!(err = cali_ct_update_elem(k, &ct_value, BPF_NOEXIST))) {
+			err = cali_ct_update_elem(k, &ct_value, BPF_NOEXIST);
+			if (err == -17 /* EEXIST */ && ct_ctx->type == CALI_CT_TYPE_NAT_REV && syn && !ack) {
+				err = ct_recycle_nat_rev_create_collision(k, &ct_value);
+			}
+			if (!err) {
 				ct_ctx->sport = sport;
 				break;
 			}
