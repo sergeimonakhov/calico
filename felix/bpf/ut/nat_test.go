@@ -2935,16 +2935,16 @@ func TestNATSourceCollisionRecyclesClosedRetryPort(t *testing.T) {
 	runBpfTest(t, "calico_from_host_ep", nil, func(bpfrun bpfProgRunFn) {
 		res, err := bpfrun(pktBytes)
 		Expect(err).NotTo(HaveOccurred())
+		bpfCounters, err := counters.Read(countersMap, 1, 0)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(int(bpfCounters[counters.SourceCollisionResolutionFailed])).To(Equal(0),
+			"a closed PSNAT retry-port entry should be recycled, not counted as an unresolved collision")
 		Expect(res.Retval).To(Equal(resTC_ACT_REDIRECT))
 
 		pktR := gopacket.NewPacket(res.dataOut, layers.LayerTypeEthernet, gopacket.Default)
 		tcpL := pktR.Layer(layers.LayerTypeTCP)
 		Expect(tcpL).NotTo(BeNil())
 		Expect(uint16(tcpL.(*layers.TCP).SrcPort)).To(Equal(psnatPort))
-
-		bpfCounters, err := counters.Read(countersMap, 1, 0)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(int(bpfCounters[counters.SourceCollisionResolutionFailed])).To(Equal(0))
 	}, withPSNATPorts(psnatPort, psnatPort))
 
 	ct, err := conntrack.LoadMapMem(ctMap)
