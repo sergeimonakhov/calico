@@ -182,11 +182,18 @@ static CALI_BPF_INLINE void ct_recycle(struct calico_ct_value *tracking_v, struc
 	cali_ct_delete_elem(k);
 }
 
-/* ct_fwd_matches_rev reports whether rev's original destination is fk's service end. Mirrored by fwdMatchesRev in cleanup.go. */
+/* ct_fwd_matches_rev reports whether rev belongs to fk's forward flow. Mirrored by fwdMatchesRev in cleanup.go. */
 static CALI_BPF_INLINE bool ct_fwd_matches_rev(struct calico_ct_key *fk, struct calico_ct_value *rev)
 {
-	return (ip_equal(fk->addr_a, rev->orig_ip) && fk->port_a == rev->orig_port) ||
-		(ip_equal(fk->addr_b, rev->orig_ip) && fk->port_b == rev->orig_port);
+	if (ip_equal(fk->addr_a, rev->orig_ip) && fk->port_a == rev->orig_port) {
+		return (ip_void(rev->orig_sip) || ip_equal(fk->addr_b, rev->orig_sip)) &&
+			(rev->orig_sport == 0 || fk->port_b == 0 || fk->port_b == rev->orig_sport);
+	}
+	if (ip_equal(fk->addr_b, rev->orig_ip) && fk->port_b == rev->orig_port) {
+		return (ip_void(rev->orig_sip) || ip_equal(fk->addr_a, rev->orig_sip)) &&
+			(rev->orig_sport == 0 || fk->port_a == 0 || fk->port_a == rev->orig_sport);
+	}
+	return false;
 }
 
 /* ct_fwd_tracking returns the reverse entry that forward entry fwd, keyed fk, tracks, or NULL if fwd is stale. */
