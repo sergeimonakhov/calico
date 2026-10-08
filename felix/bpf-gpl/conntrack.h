@@ -201,7 +201,8 @@ static CALI_BPF_INLINE struct calico_ct_value *ct_fwd_tracking(struct calico_ct_
 }
 
 /* ct_recycle_nat_rev_create_collision tries to clear a closed or stale entry that blocked NAT reverse creation. */
-static CALI_BPF_INLINE int ct_recycle_nat_rev_create_collision(struct calico_ct_key *k,
+static CALI_BPF_INLINE int ct_recycle_nat_rev_create_collision(struct cali_tc_ctx *ctx,
+							      struct calico_ct_key *k,
 							      struct calico_ct_value *ct_value)
 {
 	struct calico_ct_value *old = cali_ct_lookup_elem(k);
@@ -412,7 +413,7 @@ create:
 
 	/* A NAT'd SYN never looked up the post-NAT key, so a closed entry there was not recycled yet. */
 	if (err == -17 /* EEXIST */ && ct_ctx->type == CALI_CT_TYPE_NAT_REV && syn && !ack) {
-		err = ct_recycle_nat_rev_create_collision(k, &ct_value);
+		err = ct_recycle_nat_rev_create_collision(ctx, k, &ct_value);
 	}
 
 	if (CALI_F_HEP && err == -17 /* EEXIST */) {
@@ -437,7 +438,7 @@ create:
 
 			err = cali_ct_update_elem(k, &ct_value, BPF_NOEXIST);
 			if (err == -17 /* EEXIST */ && ct_ctx->type == CALI_CT_TYPE_NAT_REV && syn && !ack) {
-				err = ct_recycle_nat_rev_create_collision(k, &ct_value);
+				err = ct_recycle_nat_rev_create_collision(ctx, k, &ct_value);
 			}
 			if (!err) {
 				ct_ctx->sport = sport;
