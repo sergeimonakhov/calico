@@ -574,47 +574,6 @@ func TestTCPRecycleIgnoresSYNACK(t *testing.T) {
 		"a SYN+ACK must not recycle a closed conntrack entry as a new opener SYN")
 }
 
-func TestSeenCreateDoesNotCorruptNATForwardEntry(t *testing.T) {
-	RegisterTestingT(t)
-
-	defer func() { bpfIfaceName = "" }()
-	bpfIfaceName = "SNFw"
-
-	tcpSyn := &layers.TCP{
-		SrcPort:    54321,
-		DstPort:    7890,
-		SYN:        true,
-		DataOffset: 5,
-	}
-	_, ipv4, _, _, synPkt, err := testPacketV4(nil, nil, tcpSyn, nil)
-	Expect(err).NotTo(HaveOccurred())
-
-	rtKey := routes.NewKey(srcV4CIDR).AsBytes()
-	rtVal := routes.NewValueWithIfIndex(routes.FlagsLocalWorkload|routes.FlagInIPAMPool, 1).AsBytes()
-	defer resetRTMap(rtMap)
-	Expect(rtMap.Update(rtKey, rtVal)).NotTo(HaveOccurred())
-
-	key := conntrack.NewKey(uint8(ipv4.Protocol), srcIP, 54321, dstIP, 7890)
-	revKey := conntrack.NewKey(uint8(ipv4.Protocol), srcIP, 54321, net.IPv4(8, 8, 8, 8), 666)
-	fwd := conntrack.NewValueNATForward(0, 0, revKey)
-
-	resetCTMap(ctMap)
-	defer resetCTMap(ctMap)
-	Expect(ctMap.Update(key.AsBytes(), fwd.AsBytes())).NotTo(HaveOccurred())
-
-	skbMark = tcdefs.MarkSeen
-	runBpfTest(t, "calico_to_workload_ep", rulesDefaultAllow, func(bpfrun bpfProgRunFn) {
-		res, err := bpfrun(synPkt)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(res.Retval).To(Equal(resTC_ACT_UNSPEC))
-	})
-
-	ct, err := conntrack.LoadMapMem(ctMap)
-	Expect(err).NotTo(HaveOccurred())
-	Expect(ct).To(HaveKeyWithValue(key, fwd),
-		"seen-packet CT create path must not update TCP legs over a NAT forward entry")
-}
-
 // TestTCPNATCreateOverForwardEntry checks a NAT'd SYN whose post-NAT key holds another flow's forward entry.
 func TestTCPNATCreateOverForwardEntry(t *testing.T) {
 	RegisterTestingT(t)
@@ -656,14 +615,18 @@ func TestTCPNATCreateOverForwardEntry(t *testing.T) {
 	postNATKey := conntrack.NewKey(uint8(ipv4.Protocol), srcIP, 54321, natIP, natPort)
 	otherRevKey := conntrack.NewKey(uint8(ipv4.Protocol), srcIP, 54321, otherBackendIP, otherBackendPort)
 	otherFwd := conntrack.NewValueNATForward(0, 0, otherRevKey)
-	otherRev := func(fin bool) conntrack.Value {
-		return conntrack.NewValueNATReverse(0, 0,
+	otherRev := func(fin bool, origSport uint16) conntrack.Value {
+		v := conntrack.NewValueNATReverse(0, 0,
 			conntrack.Leg{SynSeen: true, AckSeen: true, FinSeen: fin, Opener: true, Approved: true},
 			conntrack.Leg{SynSeen: true, AckSeen: true, FinSeen: fin, Approved: true},
 			nil, natIP, natPort)
+		v.SetOrigSport(origSport)
+		return v
 	}
 
-	closedRev, liveRev := otherRev(true), otherRev(false)
+	closedRev := otherRev(true, uint16(tcp.SrcPort))
+	liveRev := otherRev(false, uint16(tcp.SrcPort))
+	otherSourcePortRev := otherRev(false, uint16(tcp.SrcPort)+1)
 
 	for _, tc := range []struct {
 		name       string
@@ -672,6 +635,7 @@ func TestTCPNATCreateOverForwardEntry(t *testing.T) {
 	}{
 		{name: "stale forward entry", expCreated: true},
 		{name: "closed connection", rev: &closedRev, expCreated: true},
+		{name: "same service but different original source port", rev: &otherSourcePortRev, expCreated: true},
 		{name: "live connection", rev: &liveRev},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

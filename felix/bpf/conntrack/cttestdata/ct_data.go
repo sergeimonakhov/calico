@@ -105,6 +105,14 @@ func addSingleKVTest(desc string, k conntrack.Key, v conntrack.Value, deletionEx
 	}
 }
 
+func makeNATReverseWithOrigSport(lastSeen time.Duration, origSport uint16) conntrack.Value {
+	v := conntrack.NewValueNATReverse(lastSeen, 0,
+		conntrack.Leg{SynSeen: true, AckSeen: true}, conntrack.Leg{SynSeen: true, AckSeen: true},
+		nil, ipSvc, 80)
+	v.SetOrigSport(origSport)
+	return v
+}
+
 func init() {
 	CTCleanupTests = append(CTCleanupTests,
 		CTCleanupTest{
@@ -184,6 +192,14 @@ func init() {
 				tcpRevKey: conntrack.NewValueNATReverse(Now-1*time.Minute, 0,
 					conntrack.Leg{SynSeen: true, AckSeen: true}, conntrack.Leg{SynSeen: true, AckSeen: true},
 					nil, ipSvc, 81),
+			},
+			ExpectedDeletions: []conntrack.Key{tcpFwdKey},
+		},
+		CTCleanupTest{
+			Description: "forward NAT entry whose reverse key holds another source port's live reverse entry",
+			KVs: map[conntrack.Key]conntrack.Value{
+				tcpFwdKey: conntrack.NewValueNATForward(Now-3*time.Hour, 0, tcpRevKey),
+				tcpRevKey: makeNATReverseWithOrigSport(Now-1*time.Minute, 6666),
 			},
 			ExpectedDeletions: []conntrack.Key{tcpFwdKey},
 		},
