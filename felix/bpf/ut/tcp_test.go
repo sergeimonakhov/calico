@@ -629,12 +629,13 @@ func TestTCPNATCreateOverForwardEntry(t *testing.T) {
 	otherSourcePortRev := otherRev(false, uint16(tcp.SrcPort)+1)
 
 	for _, tc := range []struct {
-		name       string
-		rev        *conntrack.Value
-		expCreated bool
+		name         string
+		rev          *conntrack.Value
+		expCreated   bool
+		expDeleteRev bool
 	}{
 		{name: "stale forward entry", expCreated: true},
-		{name: "closed connection", rev: &closedRev, expCreated: true},
+		{name: "closed connection", rev: &closedRev, expCreated: true, expDeleteRev: true},
 		{name: "same service but different original source port", rev: &otherSourcePortRev, expCreated: true},
 		{name: "live connection", rev: &liveRev},
 	} {
@@ -666,7 +667,11 @@ func TestTCPNATCreateOverForwardEntry(t *testing.T) {
 			if tc.expCreated {
 				Expect(ct[postNATKey].Type()).To(Equal(conntrack.TypeNATReverse))
 				Expect(ct[postNATKey].OrigPort()).To(Equal(uint16(7890)))
-				Expect(ct).NotTo(HaveKey(otherRevKey))
+				if tc.expDeleteRev {
+					Expect(ct).NotTo(HaveKey(otherRevKey))
+				} else if tc.rev != nil {
+					Expect(ct).To(HaveKeyWithValue(otherRevKey, *tc.rev))
+				}
 			} else {
 				Expect(ct).To(HaveKeyWithValue(postNATKey, otherFwd))
 				Expect(ct).To(HaveKeyWithValue(otherRevKey, *tc.rev))
