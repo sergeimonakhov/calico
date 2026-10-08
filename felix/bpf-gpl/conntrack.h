@@ -512,7 +512,12 @@ static CALI_BPF_INLINE int calico_ct_create_nat_fwd(struct cali_tc_ctx *ctx,
 	if (ct_ctx->orig_sport != ct_ctx->sport) {
 		ct_value.nat_sport = ct_ctx->sport;
 	}
-	int err = cali_ct_update_elem(k, &ct_value, 0);
+	int err;
+#if defined(UNITTEST) && defined(CALI_UNITTEST_CT_NAT_FWD_FAIL)
+	err = -5;
+#else
+	err = cali_ct_update_elem(k, &ct_value, 0);
+#endif
 	CALI_VERB("CT-%d Create result: %d.", ctx->state->ip_proto, err);
 	return err;
 }
@@ -1381,9 +1386,10 @@ static CALI_BPF_INLINE int conntrack_create(struct cali_tc_ctx *ctx, struct ct_c
 	}
 
 	if (ct_ctx->type == CALI_CT_TYPE_NAT_REV) {
+		struct calico_ct_key tracking_key = *k;
 		err = calico_ct_create_nat_fwd(ctx, ct_ctx, k);
 		if (err) {
-			/* XXX we should clean up the tracking entry */
+			cali_ct_delete_elem(&tracking_key);
 		}
 	}
 
