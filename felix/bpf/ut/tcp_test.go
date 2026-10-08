@@ -15,6 +15,7 @@
 package ut_test
 
 import (
+	"encoding/binary"
 	"fmt"
 	"net"
 	"testing"
@@ -572,6 +573,68 @@ func TestTCPRecycleIgnoresSYNACK(t *testing.T) {
 	Expect(ct).To(HaveKey(key))
 	Expect(ct[key].Data().FINsSeen()).To(BeTrue(),
 		"a SYN+ACK must not recycle a closed conntrack entry as a new opener SYN")
+}
+
+func TestTCPSeenNATCreateOverForwardEntry(t *testing.T) {
+	RegisterTestingT(t)
+
+	defer func() { bpfIfaceName = "" }()
+
+	natIP := net.IPv4(8, 8, 8, 8).To4()
+	natPort := uint16(666)
+	otherBackendIP := net.IPv4(9, 9, 9, 9).To4()
+	otherBackendPort := uint16(999)
+
+	tcpSyn := &layers.TCP{
+		SrcPort:    54321,
+		DstPort:    7890,
+		SYN:        true,
+		DataOffset: 5,
+	}
+	_, ipv4, l4, _, synPkt, err := testPacketV4(nil, nil, tcpSyn, nil)
+	Expect(err).NotTo(HaveOccurred())
+	tcp := l4.(*layers.TCP)
+
+	Expect(natMap.Update(
+		nat.NewNATKey(ipv4.DstIP, uint16(tcp.DstPort), uint8(ipv4.Protocol)).AsBytes(),
+		nat.NewNATValue(0, 1, 0, 0).AsBytes(),
+	)).NotTo(HaveOccurred())
+	defer resetMap(natMap)
+	Expect(natBEMap.Update(
+		nat.NewNATBackendKey(0, 0).AsBytes(),
+		nat.NewNATBackendValue(natIP, natPort).AsBytes(),
+	)).NotTo(HaveOccurred())
+	defer resetMap(natBEMap)
+
+	rtKey := routes.NewKey(srcV4CIDR).AsBytes()
+	rtVal := routes.NewValueWithIfIndex(routes.FlagsLocalWorkload|routes.FlagInIPAMPool, 1).AsBytes()
+	defer resetRTMap(rtMap)
+	Expect(rtMap.Update(rtKey, rtVal)).NotTo(HaveOccurred())
+
+	postNATKey := conntrack.NewKey(uint8(ipv4.Protocol), srcIP, uint16(tcp.SrcPort), natIP, natPort)
+	otherRevKey := conntrack.NewKey(uint8(ipv4.Protocol), srcIP, uint16(tcp.SrcPort), otherBackendIP, otherBackendPort)
+	otherFwd := conntrack.NewValueNATForward(0, 0, otherRevKey)
+
+	resetCTMap(ctMap)
+	defer resetCTMap(ctMap)
+	Expect(ctMap.Update(postNATKey.AsBytes(), otherFwd.AsBytes())).NotTo(HaveOccurred())
+
+	ctxIn := make([]byte, 18*4)
+	binary.LittleEndian.PutUint32(ctxIn[2*4:3*4], tcdefs.MarkSeen)
+	bpfIfaceName = "SNcF"
+	setupAndRun(t, "debug", "calico_from_workload_ep", rulesDefaultAllow, func(progName string) {
+		res, err := bpftoolProgRun(progName, synPkt, ctxIn)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.Retval).To(Equal(resTC_ACT_REDIRECT))
+	})
+
+	ct, err := conntrack.LoadMapMem(ctMap)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(ct).To(HaveKey(postNATKey))
+	Expect(ct[postNATKey].Type()).To(Equal(conntrack.TypeNATReverse),
+		"seen-packet NAT create path must not update TCP legs over a NAT forward entry")
+	Expect(ct[postNATKey].OrigPort()).To(Equal(uint16(tcp.DstPort)))
+	Expect(ct).NotTo(HaveKey(otherRevKey))
 }
 
 // TestTCPNATCreateOverForwardEntry checks a NAT'd SYN whose post-NAT key holds another flow's forward entry.
