@@ -278,6 +278,10 @@ static CALI_BPF_INLINE int calico_ct_v4_create_tracking(struct cali_tc_ctx *ctx,
 			}
 			goto create;
 		}
+		if (ct_value->type != CALI_CT_TYPE_NORMAL && ct_value->type != CALI_CT_TYPE_NAT_REV) {
+			CALI_DEBUG("CT-ALL marked packet lookup hit unexpected entry type %d", ct_value->type);
+			goto create;
+		}
 		struct calico_ct_leg *pkt_leg, *other_leg;
 
 		if (srcLTDest) {
