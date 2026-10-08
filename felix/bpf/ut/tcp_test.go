@@ -531,6 +531,49 @@ func TestTCPRecycleNeedsFINsBothWays(t *testing.T) {
 	}
 }
 
+func TestTCPRecycleIgnoresSYNACK(t *testing.T) {
+	RegisterTestingT(t)
+
+	defer func() { bpfIfaceName = "" }()
+
+	tcpSynAck := &layers.TCP{
+		SrcPort:    54321,
+		DstPort:    7890,
+		SYN:        true,
+		ACK:        true,
+		DataOffset: 5,
+	}
+	_, ipv4, _, _, synAckPkt, err := testPacketV4(nil, nil, tcpSynAck, nil)
+	Expect(err).NotTo(HaveOccurred())
+
+	rtKey := routes.NewKey(srcV4CIDR).AsBytes()
+	rtVal := routes.NewValueWithIfIndex(routes.FlagsLocalWorkload|routes.FlagInIPAMPool, 1).AsBytes()
+	defer resetRTMap(rtMap)
+	Expect(rtMap.Update(rtKey, rtVal)).NotTo(HaveOccurred())
+
+	key := conntrack.NewKey(uint8(ipv4.Protocol), srcIP, 54321, dstIP, 7890)
+	old := conntrack.NewValueNormal(0, 0,
+		conntrack.Leg{SynSeen: true, AckSeen: true, FinSeen: true, Opener: true, Approved: true},
+		conntrack.Leg{SynSeen: true, AckSeen: true, FinSeen: true, Approved: true})
+	resetCTMap(ctMap)
+	defer resetCTMap(ctMap)
+	Expect(ctMap.Update(key.AsBytes(), old.AsBytes())).NotTo(HaveOccurred())
+
+	bpfIfaceName = "RcSA"
+	skbMark = 0
+	runBpfTest(t, "calico_from_workload_ep", rulesDefaultAllow, func(bpfrun bpfProgRunFn) {
+		res, err := bpfrun(synAckPkt)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.Retval).To(Equal(resTC_ACT_REDIRECT))
+	})
+
+	ct, err := conntrack.LoadMapMem(ctMap)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(ct).To(HaveKey(key))
+	Expect(ct[key].Data().FINsSeen()).To(BeTrue(),
+		"a SYN+ACK must not recycle a closed conntrack entry as a new opener SYN")
+}
+
 // TestTCPNATCreateOverForwardEntry checks a NAT'd SYN whose post-NAT key holds another flow's forward entry.
 func TestTCPNATCreateOverForwardEntry(t *testing.T) {
 	RegisterTestingT(t)
